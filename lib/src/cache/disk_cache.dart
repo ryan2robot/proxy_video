@@ -80,25 +80,6 @@ class CacheEntryStats {
     return total == 0 ? null : cacheHits / total;
   }
 
-  /// JSON projection for `/api/stats`.
-  Map<String, Object?> toJson() => <String, Object?>{
-    'key': key,
-    'totalSize': totalSize,
-    'chunkSize': chunkSize,
-    'chunkCount': chunkCount,
-    'readyChunks': readyChunks,
-    'cachedBytes': cachedBytes,
-    'cachedFraction': cachedFraction,
-    'complete': complete,
-    'lastAccessAt': lastAccessAt.toUtc().toIso8601String(),
-    'chunkBitmap': chunkBitmap,
-    'upstreamRequests': upstreamRequests,
-    'cacheHits': cacheHits,
-    'cacheMisses': cacheMisses,
-    if (cacheHitRate != null) 'cacheHitRate': cacheHitRate,
-    if (etag != null) 'etag': etag,
-    if (contentType != null) 'contentType': contentType,
-  };
 }
 
 /// Aggregate cache statistics.
@@ -133,19 +114,6 @@ class CacheStats {
 
   /// Per-object statistics.
   final List<CacheEntryStats> entries;
-
-  /// JSON projection for `/api/stats`.
-  Map<String, Object?> toJson() => <String, Object?>{
-    'entryCount': entryCount,
-    'totalBytes': totalBytes,
-    'totalBytesHuman': formatByteSize(totalBytes),
-    'maxBytes': maxBytes,
-    'maxBytesHuman': maxBytes == 0 ? 'unlimited' : formatByteSize(maxBytes),
-    'chunkSize': chunkSize,
-    'upstreamInUse': upstreamInUse,
-    'upstreamCapacity': upstreamCapacity,
-    'entries': entries.map((CacheEntryStats entry) => entry.toJson()).toList(),
-  };
 }
 
 /// Disk-backed chunk cache for proxied media.
@@ -233,6 +201,7 @@ class DiskCache {
       log: _log,
       prefetchAhead: prefetchAhead,
       onChunkCached: _onChunkCached,
+      onChunkEvent: _onChunkEvent,
       meta: await _readMeta(files.meta, safeKey),
     );
 
@@ -265,28 +234,35 @@ class DiskCache {
       chunkSize: chunkSize,
       upstreamInUse: limiter.inUse,
       upstreamCapacity: limiter.capacity,
-      entries: entries
-          .map(
-            (CacheEntry entry) => CacheEntryStats(
-              key: entry.key,
-              totalSize: entry.knownTotalSize ?? 0,
-              chunkSize: entry.chunkSize,
-              chunkCount: entry.chunkCount,
-              readyChunks: entry.readyChunkCount,
-              cachedBytes: entry.cachedBytes,
-              complete: entry.isComplete,
-              lastAccessAt: entry.lastAccessAt,
-              chunkBitmap: entry.chunkBitmapBase64(),
-              etag: entry.etag,
-              contentType: entry.contentType,
-              upstreamRequests: entry.upstreamRequestCount,
-              cacheHits: entry.cacheHits,
-              cacheMisses: entry.cacheMisses,
-            ),
-          )
-          .toList(growable: false),
+      entries: entries.map(_statsFor).toList(growable: false),
     );
   }
+
+  /// Statistics for a single tracked entry, or `null` when it is not known.
+  ///
+  /// Unlike [stats] this never rescans the cache directory, because an event
+  /// stream calls it once per connection while playback is already running.
+  CacheEntryStats? statsFor(String key) {
+    final entry = peekEntry(key);
+    return entry == null ? null : _statsFor(entry);
+  }
+
+  static CacheEntryStats _statsFor(CacheEntry entry) => CacheEntryStats(
+    key: entry.key,
+    totalSize: entry.knownTotalSize ?? 0,
+    chunkSize: entry.chunkSize,
+    chunkCount: entry.chunkCount,
+    readyChunks: entry.readyChunkCount,
+    cachedBytes: entry.cachedBytes,
+    complete: entry.isComplete,
+    lastAccessAt: entry.lastAccessAt,
+    chunkBitmap: entry.chunkBitmapBase64(),
+    etag: entry.etag,
+    contentType: entry.contentType,
+    upstreamRequests: entry.upstreamRequestCount,
+    cacheHits: entry.cacheHits,
+    cacheMisses: entry.cacheMisses,
+  );
 
   /// Drops the whole cache, or just [key] when it is provided.
   Future<void> clear({String? key}) async {
@@ -392,6 +368,7 @@ class DiskCache {
       await entry.dispose();
     }
     _entries.clear();
+    await _events.close();
   }
 
   // ---------------------------------------------------------------------------
@@ -402,6 +379,14 @@ class DiskCache {
     // New bytes may have pushed the cache over budget. `enforceBudget` is
     // internally throttled, so calling it on every chunk is cheap.
     unawaited(enforceBudget());
+  }
+
+  void _onChunkEvent(ChunkEvent event) {
+    // A download in flight during shutdown would otherwise throw on a closed
+    // controller; dropping the event costs nothing, because `close()` means
+    // nobody is going to read it.
+    if (_events.isClosed) return;
+    _events.add(event);
   }
 
   Future<void> _evict(CacheEntry entry) async {

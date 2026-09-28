@@ -270,6 +270,96 @@ void main() {
     });
   });
 
+  group('chunk events', () {
+    test('reports a chunk starting, then landing on disk', () async {
+      final events = <ChunkEvent>[];
+      final subscription = cache.events.listen(events.add);
+
+      final entry = await cache.entryFor('clips/a.mp4');
+      await collect(entry.readRange(0, chunkSize - 1));
+      await pumpEventQueue();
+
+      expect(
+        events.map((ChunkEvent event) => event.phase),
+        <ChunkPhase>[ChunkPhase.started, ChunkPhase.ready],
+      );
+      expect(events.first.key, 'clips/a.mp4');
+      expect(events.first.index, 0);
+      expect(events.first.chunkCount, chunkCountFor(payloadSize, chunkSize));
+      expect(events.first.readyChunks, 0);
+      expect(events.last.readyChunks, 1);
+
+      await subscription.cancel();
+    });
+
+    test('follows every chunk of a multi-chunk read in order', () async {
+      final events = <ChunkEvent>[];
+      final subscription = cache.events.listen(events.add);
+
+      final entry = await cache.entryFor('clips/a.mp4');
+      await collect(entry.readRange(0, payloadSize - 1));
+      await pumpEventQueue();
+
+      expect(
+        events
+            .map((ChunkEvent event) => '${event.phase.name}:${event.index}')
+            .toList(),
+        <String>[
+          'started:0',
+          'ready:0',
+          'started:1',
+          'ready:1',
+          'started:2',
+          'ready:2',
+          'started:3',
+          'ready:3',
+        ],
+      );
+
+      await subscription.cancel();
+    });
+
+    test('stays silent when the bytes are already on disk', () async {
+      final entry = await cache.entryFor('clips/a.mp4');
+      await collect(entry.readRange(0, chunkSize - 1));
+
+      final events = <ChunkEvent>[];
+      final subscription = cache.events.listen(events.add);
+      await collect(entry.readRange(0, chunkSize - 1));
+      await pumpEventQueue();
+
+      expect(events, isEmpty);
+      await subscription.cancel();
+    });
+
+    test('statsFor describes one entry without scanning the cache', () async {
+      expect(cache.statsFor('clips/a.mp4'), isNull);
+
+      final entry = await cache.entryFor('clips/a.mp4');
+      await collect(entry.readRange(0, chunkSize - 1));
+
+      final stats = cache.statsFor('clips/a.mp4');
+      expect(stats, isNotNull);
+      expect(stats!.readyChunks, 1);
+      expect(stats.chunkSize, chunkSize);
+      expect(stats.chunkCount, chunkCountFor(payloadSize, chunkSize));
+      expect(stats.cachedBytes, chunkSize);
+    });
+
+    test('ends the stream when the cache closes', () async {
+      final done = Completer<void>();
+      final subscription = cache.events.listen(
+        (ChunkEvent event) {},
+        onDone: done.complete,
+      );
+
+      await cache.close();
+      await done.future.timeout(const Duration(seconds: 5));
+
+      await subscription.cancel();
+    });
+  });
+
   group('budget enforcement', () {
     test('evicts the least recently used object first', () async {
       final limited = openCache(maxBytes: budget, folder: 'lru');

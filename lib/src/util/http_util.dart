@@ -1,7 +1,3 @@
-import 'dart:convert';
-import 'dart:io';
-import 'dart:typed_data';
-
 import 'package:path/path.dart' as p;
 
 /// Characters allowed inside one path segment of an object key.
@@ -18,9 +14,8 @@ const int kMaxKeyLength = 400;
 /// Names Windows refuses to use as a file name component, with or without an
 /// extension.
 ///
-/// Keys are mapped onto real files by both the disk cache and the local bucket,
-/// so rejecting these up front keeps the two layouts identical on every
-/// platform instead of each backend sanitising differently.
+/// Keys are mapped onto real files by the disk cache, so rejecting these up
+/// front keeps the on-disk layout identical on every platform.
 const Set<String> kReservedFileNames = <String>{
   'con', 'prn', 'aux', 'nul', //
   'com1', 'com2', 'com3', 'com4', 'com5', 'com6', 'com7', 'com8', 'com9',
@@ -92,15 +87,6 @@ String contentTypeForPath(String pathOrKey) {
   return _contentTypes[extension] ?? 'application/octet-stream';
 }
 
-/// Builds a strong entity tag from the object size and modification time.
-///
-/// The origin's own `ETag` is preferred whenever it is available; this is the
-/// fallback for the local directory backend, which has none.
-String makeEtag(int size, DateTime modified) {
-  final millis = modified.toUtc().millisecondsSinceEpoch.toRadixString(16);
-  return '"${size.toRadixString(16)}-$millis"';
-}
-
 const List<String> _weekdays = <String>[
   'Mon',
   'Tue',
@@ -161,126 +147,4 @@ DateTime? parseHttpDate(String? header) {
     int.parse(match.group(5)!),
     int.parse(match.group(6)!),
   );
-}
-
-/// Content type for UTF-8 plain text.
-const String kTextContentType = 'text/plain; charset=utf-8';
-
-/// Content type for UTF-8 JSON.
-const String kJsonContentType = 'application/json; charset=utf-8';
-
-/// Content type for UTF-8 HTML.
-const String kHtmlContentType = 'text/html; charset=utf-8';
-
-/// Largest JSON body the API accepts.
-const int kMaxJsonBodyBytes = 64 * 1024;
-
-/// Writes [body] as the complete response.
-///
-/// Always sets an explicit `Content-Length`, so a client never has to guess and
-/// a half-written response is detectable rather than silently open-ended.
-Future<void> writeBody(
-  HttpResponse response,
-  List<int> body,
-  String contentType, {
-  int statusCode = HttpStatus.ok,
-}) async {
-  response
-    ..statusCode = statusCode
-    ..headers.set(HttpHeaders.contentTypeHeader, contentType)
-    ..headers.set(HttpHeaders.contentLengthHeader, '${body.length}')
-    ..add(body);
-  await response.close();
-}
-
-/// Writes [text] as a UTF-8 response.
-Future<void> writeText(
-  HttpResponse response,
-  String text,
-  String contentType, {
-  int statusCode = HttpStatus.ok,
-}) =>
-    writeBody(response, utf8.encode(text), contentType, statusCode: statusCode);
-
-/// Writes [payload] as a JSON response.
-Future<void> writeJson(
-  HttpResponse response,
-  Object? payload, {
-  int statusCode = HttpStatus.ok,
-}) => writeText(
-  response,
-  jsonEncode(payload),
-  kJsonContentType,
-  statusCode: statusCode,
-);
-
-/// Writes a short plain-text response, used for error bodies.
-Future<void> writeProblem(
-  HttpRequest request,
-  int statusCode,
-  String message,
-) async {
-  final body = utf8.encode(message);
-  final response = request.response
-    ..statusCode = statusCode
-    ..headers.set(HttpHeaders.contentTypeHeader, kTextContentType)
-    ..headers.set(HttpHeaders.contentLengthHeader, '${body.length}');
-
-  // A HEAD response carries no body, though its Content-Length still describes
-  // what a GET would have returned.
-  if (request.method != 'HEAD') response.add(body);
-  await response.close();
-}
-
-/// Reads a JSON object body, or `null` when there is none.
-///
-/// Throws a [FormatException] with a caller-friendly message when the body is
-/// oversized or not an object, so handlers can answer `400` in one place.
-Future<Map<String, Object?>?> readJsonObject(HttpRequest request) async {
-  final limitMessage =
-      'request body must be at most ${kMaxJsonBodyBytes ~/ 1024} KB and a JSON object';
-
-  if (request.contentLength > kMaxJsonBodyBytes) {
-    throw FormatException(limitMessage);
-  }
-
-  final builder = BytesBuilder(copy: false);
-  var total = 0;
-  await for (final piece in request) {
-    total += piece.length;
-    if (total > kMaxJsonBodyBytes) throw FormatException(limitMessage);
-    builder.add(piece);
-  }
-
-  final bytes = builder.takeBytes();
-  if (bytes.isEmpty) return null;
-
-  final decoded = jsonDecode(utf8.decode(bytes, allowMalformed: true));
-  if (decoded is! Map<String, Object?>) {
-    throw FormatException(limitMessage);
-  }
-  return decoded;
-}
-
-/// Reads a non-empty query parameter.
-String? queryString(Uri uri, String name) {
-  final value = uri.queryParameters[name]?.trim();
-  return (value == null || value.isEmpty) ? null : value;
-}
-
-/// Reads an integer query parameter, returning [fallback] when absent.
-int? queryInt(Uri uri, String name, {int? fallback}) {
-  final raw = queryString(uri, name);
-  if (raw == null) return fallback;
-  final parsed = int.tryParse(raw);
-  if (parsed == null) {
-    throw FormatException('query parameter "$name" must be an integer');
-  }
-  return parsed;
-}
-
-/// Reads a boolean query parameter, accepting `1`, `true` and `yes`.
-bool queryFlag(Uri uri, String name) {
-  final value = queryString(uri, name)?.toLowerCase();
-  return value == '1' || value == 'true' || value == 'yes';
 }

@@ -6,6 +6,7 @@ library;
 export 'src/api/api_routes.dart';
 export 'src/api/transcode_service.dart';
 export 'src/cache/cache_entry.dart';
+export 'src/cache/chunk_event.dart';
 export 'src/cache/disk_cache.dart';
 export 'src/cache/origin_client.dart';
 export 'src/cli/console.dart';

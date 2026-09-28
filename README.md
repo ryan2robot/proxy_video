@@ -37,6 +37,10 @@ dart run bin/server.dart          # 启动服务，按提示打开 library 地�
 打开打印出来的地址（默认 <http://127.0.0.1:8080>），在媒体库里点 **Play** 即可播放。
 播放页右侧是缓存诊断面板，可以看到分片位图、已缓存字节、上游请求次数与命中率。
 
+想直观看"边下边播"，打开 <http://127.0.0.1:8080/demo>：上方是播放器，下方是两条互相追赶的进度条
+（代理已缓存 vs 已播放），配合实时分片事件，能看到播放头始终跑在缓存完成之前。
+加 `--origin-throttle 1M` 启动时效果最明显。
+
 ### 完整验证
 
 ```bash
@@ -77,6 +81,7 @@ dart run bin/server.dart --port 9000 --origin-port 9001
 dart run bin/server.dart --chunk-size 256K        # 更小的分片 = 更快的首帧
 dart run bin/server.dart --origin-throttle 1M     # 把上游限速到 1MB/s，肉眼观察边下边播
 dart run bin/server.dart --max-cache-bytes 512M   # 缓存预算，超出按 LRU 淘汰
+dart run bin/server.dart --cors off               # 关掉跨域响应头（默认 auto：仅回环放开）
 ```
 
 页面：
@@ -85,6 +90,7 @@ dart run bin/server.dart --max-cache-bytes 512M   # 缓存预算，超出按 LRU
 | --- | --- |
 | `/` | 媒体库：卡片网格、转码上传面板、缓存/上游状态栏 |
 | `/play/<key>` | 播放页：`<video>` + 分片缓存诊断面板 |
+| `/demo` | 演示页：播放/缓存双轨进度、实时分片事件流（同一份文件也可直接双击打开） |
 
 接口：
 
@@ -93,10 +99,37 @@ dart run bin/server.dart --max-cache-bytes 512M   # 缓存预算，超出按 LRU
 | `GET` | `/media/<key>` | **核心代理**，支持 `Range` |
 | `GET` `HEAD` | `/api/media` | 已发布对象列表（含缓存进度） |
 | `GET` | `/api/stats[?key=]` | 缓存总览，或单个 key 的分片状态 |
+| `GET` | `/api/events[?key=]` | **只读事件流（SSE）**：`snapshot` 快照 + 分片 `started`/`ready` 实时推送 + `ping` 心跳 |
 | `GET` | `/api/jobs` `/api/jobs/<id>` | 转码任务列表 / 单个任务 |
 | `POST` | `/api/transcode` | 提交转码任务，body：`{"input"\|"demo", "key", "crf", "preset", "duration"}` |
 | `POST` | `/api/cache` | 清空缓存，body：`{"key": "..."}`（省略 key 清空全部） |
 | `GET` | `/healthz` | 存活与关键配置 |
+
+### 演示页
+
+`web/streaming-demo.html` 是一个自包含的单文件页面，不依赖本项目的任何路由：
+
+```bash
+dart run bin/server.dart --origin-throttle 1M   # 慢一点，肉眼看得见
+# 然后任选其一：
+#   http://127.0.0.1:8080/demo        由服务托管，同源打开
+#   双击 web/streaming-demo.html       从磁盘直开，页面内填服务地址
+```
+
+页面要素：连接栏（填服务地址、挑已发布对象）、播放器、**双轨进度**（上轨是代理已落盘的分片、
+下轨是播放位置，叠加播放器自身的 `buffered` 区间）、分片网格与实时指标。
+
+两点需要说明：
+
+- **时间轴是近似**：分片是字节维度的（默认 1 MiB），映射到时间轴按字节比例换算，页面里也这么标注。
+  真正精确的时间信息是播放器的 `buffered` 区间，两者一并显示，差异本身就是边下边播的证据。
+- **跨域**：以 `file://` 打开时页面的 `Origin` 是不透明的 `null`，需要服务端允许跨域。
+  默认 `--cors auto` 在只监听回环时放开（此时唯一的调用方就是本机浏览器）；一旦绑到非回环地址，
+  `auto` 会关掉，需要显式 `--cors on`。若浏览器仍拒绝 `file://` 访问 `127.0.0.1`，
+  改用 `http://127.0.0.1:8080/demo` 同源打开同一份文件即可。
+
+实时通道不可用（CORS 被拒、代理不支持 SSE）时，页面自动回退到 `/api/stats?key=` 轮询，
+展示不中断，只是"正在下载哪个分片"从精确变为近似。
 
 ### 3. 存储后端
 
@@ -192,6 +225,7 @@ lib/src/
   api/                   JSON API 与转码队列
   server/                手写路由 + 服务组装
   web/play_page.dart     自包含的媒体库与播放页（无 CDN、无构建步骤）
+web/streaming-demo.html  可独立打开的边下边播演示页（单文件、零外部资源）
 tool/e2e_smoke.dart      真实启动两个 CLI 的端到端冒烟
 ```
 
@@ -223,6 +257,7 @@ tool/e2e_smoke.dart      真实启动两个 CLI 的端到端冒烟
 | `PROXY_VIDEO_MAX_CONCURRENT_UPSTREAM` | `4` | 上游并发上限 |
 | `PROXY_VIDEO_PREFETCH_AHEAD` | `0` | 顺序预取的分片数 |
 | `PROXY_VIDEO_ORIGIN_THROTTLE` | `0` | 模拟 origin 限速 |
+| `PROXY_VIDEO_CORS` | `auto` | 跨域策略：`auto`（仅回环时放开）/ `on` / `off`，对应 `--cors` |
 | `PROXY_VIDEO_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `FFMPEG_PATH` | 自动发现 | ffmpeg 可执行文件路径 |
 
@@ -236,6 +271,8 @@ ffmpeg 查找顺序：`--ffmpeg` → `$FFMPEG_PATH` → `<项目根>/tools/ffmpe
 - 代理不实现条件请求（`If-None-Match` / `If-Modified-Since`），因此不使用 `304`；
   `Cache-Control: no-store` 让浏览器每次都问代理，代理则从磁盘秒回。
 - 上游必须支持 `HEAD` 并返回 `Content-Length`（COS 与主流 CDN 都支持）。
+- `/api/events` 是长连接，只用于观测、不参与缓存写入：它随客户端断开或缓存关闭而结束，
+  没有重放，迟到的订阅者会错过已完成的分片事件（首帧 `snapshot` 会补上当前状态）。
 - 上游若忽略 `Range` 返回 `200`，代理会自行裁剪出请求区间；这条路径有测试覆盖。
 - 不支持多段 Range（浏览器在播放媒体时也不会发），会降级成整文件 `200`。
 - 转码任务串行执行：并发跑多个 x264 会抢走代理服务视频所需的 CPU。
