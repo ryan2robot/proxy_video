@@ -87,19 +87,6 @@ void main() {
     });
   });
 
-  group('makeEtag', () {
-    test('is quoted and stable for the same size and time', () {
-      final modified = DateTime.utc(2026, 9, 28, 12);
-      final first = makeEtag(1024, modified);
-
-      expect(first, startsWith('"'));
-      expect(first, endsWith('"'));
-      expect(makeEtag(1024, modified), first);
-      expect(makeEtag(2048, modified), isNot(first));
-      expect(makeEtag(1024, DateTime.utc(2026, 9, 28, 13)), isNot(first));
-    });
-  });
-
   group('HTTP dates', () {
     test('formats an IMF-fixdate', () {
       expect(

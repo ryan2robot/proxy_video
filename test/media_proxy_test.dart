@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:proxy_video/proxy_video.dart';
 import 'package:test/test.dart';
 
+import 'helpers/origin_server.dart';
 import 'helpers/test_origin.dart';
 
 const int _chunkSize = 64 * 1024;
@@ -127,10 +128,7 @@ void main() {
   late OriginServer originServer;
   late Rig rig;
 
-  Uri Function(String) originUrlFor(OriginServer server) =>
-      (String key) => server.baseUri.replace(
-        pathSegments: <String>['origin', ...key.split('/')],
-      );
+  Uri Function(String) originUrlFor(OriginServer server) => server.urlFor;
 
   Future<Rig> startSlowRig(String folder, int bytesPerSecond) async {
     final throttled = OriginServer(

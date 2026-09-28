@@ -130,7 +130,7 @@ class OriginServer {
           match != null && (match.group(1)!.isNotEmpty || match.group(2)!.isNotEmpty);
 
       if (captured) {
-        final startText = match!.group(1)!;
+        final startText = match.group(1)!;
         final endText = match.group(2)!;
 
         if (startText.isEmpty) {
@@ -188,9 +188,14 @@ class OriginServer {
         response.add(piece);
         sent += piece.length;
 
-        if (throttleBytesPerSecond > 0) {
-          // Pace the response to the configured rate, measuring from the start
-          // so scheduling jitter does not accumulate into a slower transfer.
+        // Pace the response to the configured rate, measuring from the start so
+        // scheduling jitter does not accumulate into a slower transfer. The
+        // final piece is never delayed: holding the response open past its last
+        // byte would keep the file handle — and the temp directory a test is
+        // about to delete — busy for no reason.
+        if (throttleBytesPerSecond <= 0) {
+          await response.flush();
+        } else if (sent < total) {
           final budgetMs = (sent / throttleBytesPerSecond * 1000).round();
           final spentMs = stopwatch.elapsedMilliseconds;
           if (budgetMs > spentMs) {
@@ -198,8 +203,6 @@ class OriginServer {
               Duration(milliseconds: budgetMs - spentMs),
             );
           }
-        } else {
-          await response.flush();
         }
       }
     } finally {

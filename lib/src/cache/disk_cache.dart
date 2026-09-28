@@ -10,7 +10,7 @@ import '../util/semaphore.dart';
 import 'cache_entry.dart';
 import 'origin_client.dart';
 
-/// Per-object cache statistics, used by the API and the debug UI.
+/// Per-object cache statistics, for callers that want to inspect the cache.
 class CacheEntryStats {
   const CacheEntryStats({
     required this.key,
@@ -201,7 +201,6 @@ class DiskCache {
       log: _log,
       prefetchAhead: prefetchAhead,
       onChunkCached: _onChunkCached,
-      onChunkEvent: _onChunkEvent,
       meta: await _readMeta(files.meta, safeKey),
     );
 
@@ -236,15 +235,6 @@ class DiskCache {
       upstreamCapacity: limiter.capacity,
       entries: entries.map(_statsFor).toList(growable: false),
     );
-  }
-
-  /// Statistics for a single tracked entry, or `null` when it is not known.
-  ///
-  /// Unlike [stats] this never rescans the cache directory, because an event
-  /// stream calls it once per connection while playback is already running.
-  CacheEntryStats? statsFor(String key) {
-    final entry = peekEntry(key);
-    return entry == null ? null : _statsFor(entry);
   }
 
   static CacheEntryStats _statsFor(CacheEntry entry) => CacheEntryStats(
@@ -368,7 +358,6 @@ class DiskCache {
       await entry.dispose();
     }
     _entries.clear();
-    await _events.close();
   }
 
   // ---------------------------------------------------------------------------
@@ -379,14 +368,6 @@ class DiskCache {
     // New bytes may have pushed the cache over budget. `enforceBudget` is
     // internally throttled, so calling it on every chunk is cheap.
     unawaited(enforceBudget());
-  }
-
-  void _onChunkEvent(ChunkEvent event) {
-    // A download in flight during shutdown would otherwise throw on a closed
-    // controller; dropping the event costs nothing, because `close()` means
-    // nobody is going to read it.
-    if (_events.isClosed) return;
-    _events.add(event);
   }
 
   Future<void> _evict(CacheEntry entry) async {
