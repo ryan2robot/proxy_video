@@ -1,0 +1,22 @@
+name: proxy_video
+description: >-
+  Local ffmpeg transcoding, pluggable object storage, and a Dart HTTP proxy with
+  disk-backed chunk caching plus full HTTP Range/206 support, so browsers can
+  start playing a video while it is still being fetched.
+version: 0.1.0
+publish_to: none
+
+environment:
+  # 3.8 keeps the tall-style formatter on, which adds trailing commas for us
+  # and lets `require_trailing_commas` stay enforceable.
+  sdk: ^3.8.0
+
+dependencies:
+  # CLI argument parsing for bin/server.dart and bin/pipeline.dart.
+  args: ^2.7.0
+  # Cross-platform path joining/normalisation (Windows-safe).
+  path: ^1.9.1
+
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.31.1

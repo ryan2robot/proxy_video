@@ -1,1 +1,20 @@
+# Bundled ffmpeg binary (large, fetched per machine)
 tools
+
+# Dart / pub
+.dart_tool/
+.packages
+build/
+doc/api/
+
+# Mutable runtime data: origin "bucket", disk cache, scratch files
+data/
+
+# Logs
+*.log
+
+# Editor / OS noise
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

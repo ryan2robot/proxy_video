@@ -1,0 +1,19 @@
+include: package:lints/recommended.yaml
+
+analyzer:
+  language:
+    # The proxy deals with byte offsets and raw sockets; keep the type system
+    # strict so an `Object?` never silently becomes an `int`.
+    strict-casts: true
+    strict-raw-types: true
+  errors:
+    todo: ignore
+
+linter:
+  rules:
+    - always_declare_return_types
+    - avoid_print
+    - directives_ordering
+    - prefer_single_quotes
+    - require_trailing_commas
+    - unawaited_futures
