@@ -28,7 +28,6 @@ Future<void> main() async {
     originBaseUrl: Uri.parse('https://cdn.example.com'),
     cacheDirPath: './cache',
   );
-  Logger.configure(level: config.logLevel);
 
   final proxy = VideoProxy(config);
   final server = await HttpServer.bind('127.0.0.1', 8080);
@@ -61,20 +60,19 @@ curl -r 0-1023 http://127.0.0.1:8080/media/clips/movie.mp4
 | `originBaseUrl` | 必填 | 上游 base URL（`http`/`https`），保留其中的路径前缀 |
 | `cacheDirPath` | 必填 | 缓存目录，每个对象一对 `<key>.bin` + `<key>.meta.json` |
 | `chunkSize` | `1 MiB` | 分片粒度；越小首帧越快、回源请求数越多 |
-| `maxCacheBytes` | `2 GiB` | 缓存预算，超出按 LRU 淘汰；`0` 表示不淘汰 |
 | `maxConcurrentUpstream` | `4` | 并发回源上限 |
-| `prefetchAhead` | `0` | 顺序预取的分片数 |
-| `continueAfterDisconnect` | `true` | 客户端断开后继续补完当前窗口 |
 | `upstreamTimeout` | `30s` | 单次回源请求超时 |
 | `connectTimeout` | `10s` | 回源建连超时 |
-| `logLevel` | `info` | 日志级别 |
 
 需要自己组装时，`VideoProxy` 里的三件套也可以单独用：
 `HttpOriginClient`（HTTP 上游）、`DiskCache`（分片缓存）、`MediaProxy`（Range 代理）。
 
+日志用 `Logger.level` 控制级别、`Logger.sink` 替换输出（默认 stdout），
+在库外配置一次即可，`Config` 不代管。
+
 ## Range 语义
 
-这是代理的正确性核心，由 `lib/src/util/byte_range.dart` 一处实现并被测试逐条固化：
+这是代理的正确性核心，由 `lib/src/util.dart` 一处实现并被测试逐条固化：
 
 | 请求 | 响应 |
 | --- | --- |
@@ -102,28 +100,28 @@ curl -r 0-1023 http://127.0.0.1:8080/media/clips/movie.mp4
    已缓存的分片从磁盘读，天然就是 tee。
 
 缓存元数据（`totalSize` / 分片位图 / `ETag`）持久化在 `*.meta.json`，位图用 base64 编码
-（4 GiB 文件在 1 MiB 分片下只有约 700 字节）并**节流写入**，不会因为边看边下产生写放大。
-上游对象被替换时（`ETag` 或长度变化）整份缓存作废重建，避免把旧字节喂给新视频。
+（4 GiB 文件在 1 MiB 分片下只有约 700 字节）并**节流写入**，通过「写临时文件再 rename」原子替换，
+不会因为边看边下产生写放大或半个文件。上游对象被替换时（`ETag` 或长度变化）整份缓存作废重建，
+避免把旧字节喂给新视频。
 
 ### 客户端断开
 
-已发起的回源请求不受客户端影响：它是独立的 Future，消费者取消 stream 不会取消它，
-分片照常落盘。已经写出去一半、但连接真断了的窗口，会从**第一个未缓存的分片**继续在后台补完
-（可用 `continueAfterDisconnect: false` 关闭）。
+已经发起的回源分片请求不受客户端影响：它是独立的 Future，消费者取消 stream 不会取消它，
+分片照常落盘，因此**断连不会丢掉已取回的字节**。断掉之后不再继续补完当前窗口；
+下次请求同一段时会直接命中已经落盘的分片，只回源真正缺失的部分。
 
 ## 目录
 
 ```
 lib/src/
-  config.dart                  全部设置与校验
-  video_proxy.dart             装配门面：Config → origin + cache + proxy
-  proxy/http_origin_client.dart   HTTP 上游客户端（HEAD + Range）
-  proxy/media_proxy.dart          Range 代理：206 / 416 / 断连续传
-  cache/cache_entry.dart          分片状态机：single-flight、落盘、元数据
-  cache/disk_cache.dart           磁盘布局、统计、LRU 淘汰
-  cache/origin_client.dart        上游抽象与错误类型
-  util/                           Range 解析、key 校验、字节尺寸、信号量、日志
-example/proxy_server.dart         最小可用服务
+  config.dart        全部设置与校验
+  video_proxy.dart   装配门面：Config → origin + cache + proxy
+  origin.dart        上游抽象与 HTTP 实现（HEAD + Range）
+  media_proxy.dart   Range 代理：206 / 416 / 405 / 断连
+  cache.dart         分片状态机与磁盘布局：single-flight、落盘、元数据
+  util.dart          Range 解析、key 校验、Content-Type、HTTP 日期、信号量、互斥量
+  logger.dart        结构化日志
+example/proxy_server.dart   最小可用服务
 ```
 
 ## 已知限制
@@ -135,6 +133,8 @@ example/proxy_server.dart         最小可用服务
   响应带 `Cache-Control: no-store`，让客户端每次都问代理，代理则从磁盘秒回。
 - 缓存目录按 key 镜像（`<cache>/clips/a.mp4.bin`）。key 由 `sanitizeKey` 限制为
   `[A-Za-z0-9._-]` 且拒绝 `..`、绝对路径与 Windows 保留名，所以目录可读、不会碰撞、也不会被穿越。
+- **缓存不会自动回收**：库不做 LRU 淘汰，也不提供清理 API；`DiskCache.root` 就是镜像目录，
+  需要腾空间时由使用方自行删除对应的 `.bin` / `.meta.json`。
 - 缓存目录不做并发进程保护：同一个目录应由一个进程独占使用。
 
 ## 测试

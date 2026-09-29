@@ -61,11 +61,6 @@ void main() {
       expect(sanitizeKey('a' * kMaxKeyLength), isNotNull);
       expect(sanitizeKey('a' * (kMaxKeyLength + 1)), isNull);
     });
-
-    test('isValidKey mirrors sanitizeKey', () {
-      expect(isValidKey('clips/demo.mp4'), isTrue);
-      expect(isValidKey('../demo.mp4'), isFalse);
-    });
   });
 
   group('contentTypeForPath', () {

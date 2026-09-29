@@ -49,8 +49,7 @@ class OriginServer {
   Uri get baseUri => Uri(scheme: 'http', host: '127.0.0.1', port: boundPort);
 
   /// Maps an object key onto the URL this origin serves it from.
-  Uri urlFor(String key) =>
-      baseUri.replace(pathSegments: key.split('/'));
+  Uri urlFor(String key) => baseUri.replace(pathSegments: key.split('/'));
 
   /// Binds and starts serving.
   Future<void> start() async {
@@ -127,7 +126,8 @@ class OriginServer {
     if (header != null) {
       final match = _rangePattern.firstMatch(header.trim());
       final captured =
-          match != null && (match.group(1)!.isNotEmpty || match.group(2)!.isNotEmpty);
+          match != null &&
+          (match.group(1)!.isNotEmpty || match.group(2)!.isNotEmpty);
 
       if (captured) {
         final startText = match.group(1)!;
@@ -135,7 +135,9 @@ class OriginServer {
 
         if (startText.isEmpty) {
           final suffix = int.parse(endText);
-          if (suffix <= 0 || length == 0) return _unsatisfiable(request, length);
+          if (suffix <= 0 || length == 0) {
+            return _unsatisfiable(request, length);
+          }
           from = math.max(0, length - suffix);
         } else {
           from = int.parse(startText);

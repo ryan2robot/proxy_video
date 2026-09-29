@@ -33,7 +33,6 @@ Future<void> main(List<String> args) async {
     chunkSize: 256 * 1024,
   );
 
-  Logger.configure(level: config.logLevel);
   final log = rootLogger;
 
   final proxy = VideoProxy(config, log: log);
@@ -43,12 +42,13 @@ Future<void> main(List<String> args) async {
   log.info(
     'serving media',
     fields: <String, Object?>{
+      'origin': config.originBaseUrl.toString(),
+      'cacheDir': config.cacheDirPath,
       'url': 'http://127.0.0.1:${server.port}/media/<key>',
-      ...config.describe(),
     },
   );
 
-  // Shutting down cleanly matters: `close()` waits for background fills, so a
+  // Shutting down cleanly matters: `close()` flushes cache metadata, so a
   // restart never finds a half-written chunk.
   StreamSubscription<ProcessSignal>? signal;
   signal = ProcessSignal.sigint.watch().listen((ProcessSignal _) async {
@@ -66,11 +66,7 @@ Future<void> main(List<String> args) async {
   await proxy.close();
 }
 
-Future<void> _serve(
-  HttpRequest request,
-  VideoProxy proxy,
-  Logger log,
-) async {
+Future<void> _serve(HttpRequest request, VideoProxy proxy, Logger log) async {
   final segments = request.uri.pathSegments;
   if (segments.length < 2 || segments.first != 'media') {
     request.response

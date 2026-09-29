@@ -2,10 +2,111 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
-import '../cache/origin_client.dart';
-import '../logger.dart';
-import '../util/byte_range.dart';
-import '../util/http_util.dart';
+import 'logger.dart';
+import 'util.dart';
+
+/// Metadata the origin advertises for one object.
+class OriginMetadata {
+  const OriginMetadata({
+    required this.totalSize,
+    this.etag,
+    this.lastModified,
+    this.contentType,
+  });
+
+  /// Total object size in bytes.
+  final int totalSize;
+
+  /// Origin entity tag, when it exposes one.
+  final String? etag;
+
+  /// Origin modification time, when it exposes one.
+  final DateTime? lastModified;
+
+  /// Origin content type, when it exposes one.
+  final String? contentType;
+
+  @override
+  String toString() =>
+      'OriginMetadata(size: $totalSize, etag: $etag, type: $contentType)';
+}
+
+/// Raised when the origin reports that an object does not exist.
+class OriginNotFoundException implements Exception {
+  const OriginNotFoundException(this.key);
+
+  /// The missing object key.
+  final String key;
+
+  @override
+  String toString() => 'OriginNotFoundException: "$key" was not found upstream';
+}
+
+/// Thrown when the origin returns fewer bytes than a range asked for.
+class OriginTruncatedException implements Exception {
+  const OriginTruncatedException({
+    required this.key,
+    required this.expected,
+    required this.received,
+  });
+
+  /// The object being read.
+  final String key;
+
+  /// Number of bytes requested.
+  final int expected;
+
+  /// Number of bytes actually delivered.
+  final int received;
+
+  @override
+  String toString() =>
+      'OriginTruncatedException: "$key" delivered $received of $expected bytes';
+}
+
+/// Raised when the origin answers a range request with an unexpected status.
+class OriginRequestException implements Exception {
+  const OriginRequestException({
+    required this.key,
+    required this.statusCode,
+    this.detail,
+  });
+
+  /// Object that was requested.
+  final String key;
+
+  /// HTTP status the origin answered with; `0` for a transport-level failure.
+  final int statusCode;
+
+  /// Extra context, such as a timeout description.
+  final String? detail;
+
+  @override
+  String toString() {
+    final suffix = detail == null ? '' : ' ($detail)';
+    return 'OriginRequestException: "$key" answered $statusCode$suffix';
+  }
+}
+
+/// Reads byte ranges from the origin (a real CDN, or a test double).
+///
+/// Deliberately narrow: the cache layer only ever needs to ask "how big is this
+/// object" and "give me this byte range", which is exactly the surface a CDN
+/// exposes.
+abstract class OriginClient {
+  /// Returns metadata for [key], or `null` when the object is missing.
+  Future<OriginMetadata?> head(String key);
+
+  /// Streams the inclusive byte range [start]-[end] of [key].
+  ///
+  /// Implementations must emit exactly `end - start + 1` bytes beginning at
+  /// [start], even when the origin ignores `Range` and answers `200`: skipping
+  /// the leading bytes is the client's responsibility.
+  Stream<List<int>> openRange(String key, int start, int end);
+
+  /// Releases pooled connections.
+  void close();
+}
 
 /// [OriginClient] that reads ranges over HTTP from a CDN or object store.
 ///
@@ -16,7 +117,6 @@ import '../util/http_util.dart';
 ///
 /// Requires the origin to answer `HEAD` with a `Content-Length`: that is how
 /// the cache learns an object's size before deciding which chunks to fetch.
-/// Both Tencent COS and a CDN in front of it do.
 class HttpOriginClient implements OriginClient {
   HttpOriginClient({
     required this.urlFor,
@@ -75,10 +175,6 @@ class HttpOriginClient implements OriginClient {
         response.headers.value(HttpHeaders.lastModifiedHeader),
       ),
       contentType: response.headers.contentType?.toString(),
-      acceptsRanges:
-          (response.headers.value(HttpHeaders.acceptRangesHeader) ?? '')
-              .toLowerCase()
-              .contains('bytes'),
     );
   }
 
@@ -92,7 +188,9 @@ class HttpOriginClient implements OriginClient {
 
       case HttpStatus.ok:
         // The origin ignored `Range` and answered `200`. Trim on this side so
-        // callers still receive exactly the window they asked for.
+        // callers still receive exactly the window they asked for; letting it
+        // through untrimmed would poison the cache with bytes written at the
+        // wrong offset.
         yield* _trim(response, key: key, start: start, end: end);
 
       case HttpStatus.notFound:
@@ -108,8 +206,6 @@ class HttpOriginClient implements OriginClient {
         );
 
       default:
-        // Only reached on an error status, so the body has to be read (and
-        // reported) before the connection can be reused.
         final detail = await _readBody(response);
         throw OriginRequestException(
           key: key,
@@ -144,10 +240,6 @@ class HttpOriginClient implements OriginClient {
   }
 
   /// Trims a `200` body down to the requested window.
-  ///
-  /// Letting a range-ignorant origin through untrimmed would poison the cache
-  /// with bytes written at the wrong offset, so this is a correctness feature
-  /// rather than an optimisation.
   Stream<List<int>> _trim(
     HttpClientResponse response, {
     required String key,

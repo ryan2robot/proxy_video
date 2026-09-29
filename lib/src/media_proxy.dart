@@ -1,12 +1,10 @@
 import 'dart:async';
 import 'dart:io';
 
-import '../cache/cache_entry.dart';
-import '../cache/disk_cache.dart';
-import '../cache/origin_client.dart';
-import '../logger.dart';
-import '../util/byte_range.dart';
-import '../util/http_util.dart';
+import 'cache.dart';
+import 'logger.dart';
+import 'origin.dart';
+import 'util.dart';
 
 /// What one served window cost, used for request logging.
 typedef _PumpOutcome = ({
@@ -19,33 +17,19 @@ typedef _PumpOutcome = ({
 /// Serves media to browsers on top of the chunk cache, with the full range
 /// semantics a `<video>` element depends on.
 ///
-/// Two things make progressive playback work:
-///
-///  * answering a `Range` request with `206` and a matching `Content-Range`,
-///    so the player knows the object's size and where it may seek, and
-///  * streaming bytes as soon as the first chunk is on disk, instead of
-///    buffering the whole object first.
-///
-/// Both live in [CacheEntry.readRange]; this class is the thin, testable
-/// translation layer between HTTP and the cache. Every byte it forwards has
-/// already been written to disk, which is why a second view of the same window
-/// never touches the origin.
+/// Two things make progressive playback work: answering a `Range` request with
+/// `206` and a matching `Content-Range`, so the player knows the object's size
+/// and where it may seek, and streaming bytes as soon as the first chunk is on
+/// disk instead of buffering the whole object first. Both live in
+/// [CacheEntry.readRange]; this class is the thin translation layer between
+/// HTTP and the cache. Every byte it forwards has already been written to disk,
+/// which is why a second view of the same window never touches the origin.
 class MediaProxy {
-  MediaProxy({
-    required this.cache,
-    this.continueAfterDisconnect = true,
-    Logger? log,
-  }) : _log = (log ?? rootLogger).child('proxy');
+  MediaProxy({required this.cache, Logger? log})
+    : _log = (log ?? rootLogger).child('proxy');
 
   /// Chunk cache that owns both the bytes and the upstream traffic.
   final DiskCache cache;
-
-  /// Whether an aborted response keeps filling the cache in the background.
-  ///
-  /// When a player seeks away or the tab closes, the bytes it was about to
-  /// receive are exactly what the next request will ask for. Finishing the
-  /// window turns a wasted transfer into a warm cache.
-  final bool continueAfterDisconnect;
 
   /// Upper bound on the final response close.
   ///
@@ -55,15 +39,6 @@ class MediaProxy {
   static const Duration _closeTimeout = Duration(seconds: 10);
 
   final Logger _log;
-  final Set<Future<void>> _backgroundFills = <Future<void>>{};
-  int _backgroundFillCount = 0;
-  int _backgroundFillTotal = 0;
-
-  /// Background cache fills currently running.
-  int get backgroundFillCount => _backgroundFillCount;
-
-  /// Background cache fills started since launch.
-  int get backgroundFillTotal => _backgroundFillTotal;
 
   /// Serves the media object [key] to [request].
   Future<void> serve(HttpRequest request, String key) async {
@@ -86,52 +61,18 @@ class MediaProxy {
     try {
       entry = await cache.entryFor(safeKey);
       totalSize = await entry.resolveTotalSize();
-    } on OriginNotFoundException {
-      await _problem(
-        request,
-        HttpStatus.notFound,
-        '"$safeKey" is not available upstream.',
-      );
-      return;
-    } on OriginRequestException catch (error) {
-      _log.warn(
-        'upstream rejected the request',
-        fields: <String, Object?>{'key': safeKey, 'error': error},
-      );
-      await _problem(
-        request,
-        HttpStatus.badGateway,
-        'The origin rejected the request.',
-      );
-      return;
-    } on SocketException catch (error) {
-      _log.warn(
-        'upstream is unreachable',
-        fields: <String, Object?>{'key': safeKey, 'error': error},
-      );
-      await _problem(
-        request,
-        HttpStatus.badGateway,
-        'The origin is unreachable.',
-      );
-      return;
-    } on TimeoutException {
-      await _problem(
-        request,
-        HttpStatus.gatewayTimeout,
-        'The origin timed out.',
-      );
-      return;
-    } on HttpException catch (error) {
-      _log.warn(
-        'upstream connection failed',
-        fields: <String, Object?>{'key': safeKey, 'error': error},
-      );
-      await _problem(
-        request,
-        HttpStatus.badGateway,
-        'The origin connection failed.',
-      );
+    } on Object catch (error) {
+      final failure = _classifyUpstreamFailure(error, safeKey);
+      if (failure == null) rethrow;
+
+      final logMessage = failure.logMessage;
+      if (logMessage != null) {
+        _log.warn(
+          logMessage,
+          fields: <String, Object?>{'key': safeKey, 'error': error},
+        );
+      }
+      await _problem(request, failure.statusCode, failure.message);
       return;
     }
 
@@ -183,9 +124,8 @@ class MediaProxy {
       ..bufferOutput = false
       ..headers.set(HttpHeaders.acceptRangesHeader, 'bytes')
       ..headers.set(HttpHeaders.contentTypeHeader, contentType)
-      // This proxy *is* the cache. Letting the browser buffer a second copy
-      // would double the disk cost and hide the cache behaviour the debug UI
-      // exists to show.
+      // This proxy *is* the cache; letting the browser buffer a second copy
+      // would double the disk cost.
       ..headers.set(HttpHeaders.cacheControlHeader, 'no-store')
       ..headers.set(HttpHeaders.contentLengthHeader, '${window.length}');
 
@@ -221,26 +161,12 @@ class MediaProxy {
       return;
     }
 
-    // Push the status line and headers out before the first byte is fetched.
-    // A player can then size its buffer and decide where to seek while the
-    // origin is still being contacted, instead of waiting for data to learn
-    // anything at all.
+    // Push the status line and headers out before the first byte is fetched, so
+    // a player can size its buffer and decide where to seek while the origin is
+    // still being contacted.
     await response.flush();
 
-    final wasCached = entry.isRangeCached(window.start, window.end);
-    entry.recordServe(wasCached: wasCached);
-
     final outcome = await _pump(response, entry, window);
-
-    // Anything short of the whole window means the peer stopped listening
-    // before the transfer finished. An upstream failure is tracked separately
-    // and must not trigger even more upstream traffic.
-    final shortBy = window.length - outcome.sentBytes;
-    final aborted = !outcome.failed && shortBy > 0;
-
-    if (aborted && continueAfterDisconnect) {
-      _startBackgroundFill(entry, window);
-    }
 
     _log.debug(
       'served media',
@@ -248,23 +174,12 @@ class MediaProxy {
         'key': safeKey,
         'status': response.statusCode,
         'range': rangeHeader,
-        'cached': wasCached,
         'bytes': outcome.sentBytes,
         'ms': outcome.elapsedMs,
-        if (aborted) 'aborted': true,
         if (outcome.peerGone) 'peerGone': true,
-        if (shortBy > 0) 'shortBy': shortBy,
         if (outcome.failed) 'failed': true,
       },
     );
-  }
-
-  /// Waits for background cache fills, so a shutdown does not leave them
-  /// half-written.
-  Future<void> whenIdle() async {
-    while (_backgroundFills.isNotEmpty) {
-      await Future.wait<void>(_backgroundFills.toList(growable: false));
-    }
   }
 
   /// Streams [window] to the client, with the cache filling as a side effect.
@@ -330,36 +245,6 @@ class MediaProxy {
     );
   }
 
-  void _startBackgroundFill(CacheEntry entry, ByteRange window) {
-    // Resume where the transfer was cut short. Re-reading the part that already
-    // landed would double the origin traffic for nothing.
-    final resumeAt = entry.firstUncachedOffset(window.start, window.end);
-    if (resumeAt == null) return;
-
-    _backgroundFillCount++;
-    _backgroundFillTotal++;
-    final fill = () async {
-      try {
-        // Draining discards the bytes but keeps their side effect: every chunk
-        // is written to disk on the way past.
-        await entry.readRange(resumeAt, window.end).drain<void>();
-      } on Object catch (error) {
-        _log.debug(
-          'background fill stopped',
-          fields: <String, Object?>{'key': entry.key, 'error': error},
-        );
-      }
-    }();
-
-    _backgroundFills.add(fill);
-    unawaited(
-      fill.whenComplete(() {
-        _backgroundFills.remove(fill);
-        _backgroundFillCount--;
-      }),
-    );
-  }
-
   Future<void> _problem(
     HttpRequest request,
     int statusCode,
@@ -372,3 +257,35 @@ class MediaProxy {
     await response.close();
   }
 }
+
+/// Status, message and log line for an upstream failure, or `null` when the
+/// error did not come from the origin and must therefore propagate.
+({int statusCode, String message, String? logMessage})?
+_classifyUpstreamFailure(Object error, String key) => switch (error) {
+  OriginNotFoundException() => (
+    statusCode: HttpStatus.notFound,
+    message: '"$key" is not available upstream.',
+    logMessage: null,
+  ),
+  OriginRequestException() => (
+    statusCode: HttpStatus.badGateway,
+    message: 'The origin rejected the request.',
+    logMessage: 'upstream rejected the request',
+  ),
+  SocketException() => (
+    statusCode: HttpStatus.badGateway,
+    message: 'The origin is unreachable.',
+    logMessage: 'upstream is unreachable',
+  ),
+  TimeoutException() => (
+    statusCode: HttpStatus.gatewayTimeout,
+    message: 'The origin timed out.',
+    logMessage: null,
+  ),
+  HttpException() => (
+    statusCode: HttpStatus.badGateway,
+    message: 'The origin connection failed.',
+    logMessage: 'upstream connection failed',
+  ),
+  _ => null,
+};

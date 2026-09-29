@@ -14,24 +14,6 @@ enum LogLevel {
 
   /// Fixed-width label used when rendering a log line.
   final String label;
-
-  /// Parses a case-insensitive level name, returning `null` for unknown input.
-  static LogLevel? tryParse(String? raw) {
-    if (raw == null) return null;
-    switch (raw.trim().toLowerCase()) {
-      case 'debug':
-        return LogLevel.debug;
-      case 'info':
-        return LogLevel.info;
-      case 'warn':
-      case 'warning':
-        return LogLevel.warn;
-      case 'error':
-        return LogLevel.error;
-      default:
-        return null;
-    }
-  }
 }
 
 /// Sink for fully rendered log lines. Swappable so tests can capture output.
@@ -52,31 +34,8 @@ class Logger {
   /// Minimum severity that gets printed.
   static LogLevel level = LogLevel.info;
 
-  /// Whether ANSI escape sequences are added to the rendered level.
-  static bool colorEnabled = _detectColor();
-
-  static LogOutput? _outputOverride;
-
-  /// Replaces the output sink. Used by tests; pass `null` to restore stdout.
-  static void captureOutput(LogOutput? sink) => _outputOverride = sink;
-
-  /// Applies process-wide logging settings in one call.
-  static void configure({
-    LogLevel? level,
-    bool? colorEnabled,
-    LogOutput? output,
-  }) {
-    if (level != null) Logger.level = level;
-    if (colorEnabled != null) Logger.colorEnabled = colorEnabled;
-    if (output != null) _outputOverride = output;
-  }
-
-  /// Restores the defaults. Intended for `tearDown` in tests.
-  static void reset() {
-    level = LogLevel.info;
-    colorEnabled = _detectColor();
-    _outputOverride = null;
-  }
+  /// Where rendered lines go; `null` writes to stdout.
+  static LogOutput? sink;
 
   /// Derives a namespaced logger, e.g. `Logger('proxy').child('cache')`.
   Logger child(String name) => Logger(_name.isEmpty ? name : '$_name.$name');
@@ -128,7 +87,7 @@ class Logger {
     final buffer = StringBuffer()
       ..write(_timestamp())
       ..write(' ')
-      ..write(_paint(level.label, level))
+      ..write(level.label)
       ..write(' [')
       ..write(_name)
       ..write('] ')
@@ -158,7 +117,7 @@ class Logger {
 
   static const String _indent = '                        ';
 
-  static void _emit(String line) => (_outputOverride ?? _writeToStdout)(line);
+  static void _emit(String line) => (sink ?? _writeToStdout)(line);
 
   static void _writeToStdout(String line) => stdout.writeln(line);
 
@@ -171,17 +130,6 @@ class Logger {
   }
 
   static String _pad2(int value) => value.toString().padLeft(2, '0');
-
-  static String _paint(String text, LogLevel level) {
-    if (!colorEnabled) return text;
-    final code = switch (level) {
-      LogLevel.debug => '\x1B[90m',
-      LogLevel.info => '\x1B[36m',
-      LogLevel.warn => '\x1B[33m',
-      LogLevel.error => '\x1B[31m',
-    };
-    return '$code$text\x1B[0m';
-  }
 
   static String _renderValue(Object? value) {
     if (value == null) return 'null';
@@ -200,17 +148,6 @@ class Logger {
     final flat = text.replaceAll('\r', '').replaceAll('\n', r'\n');
     if (flat.length <= 512) return flat;
     return '${flat.substring(0, 512)}…(${flat.length} chars)';
-  }
-
-  static bool _detectColor() {
-    final env = Platform.environment;
-    if (env['NO_COLOR'] != null) return false;
-    if (env['FORCE_COLOR'] != null) return true;
-    try {
-      return stdout.supportsAnsiEscapes;
-    } on Object {
-      return false;
-    }
   }
 }
 

@@ -1,4 +1,3 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -21,27 +20,19 @@ Future<Uint8List> collect(Stream<List<int>> stream) async {
 void main() {
   const chunkSize = 64 * 1024;
   const payloadSize = 256 * 1024;
-  const budget = 300 * 1024;
+  const chunkCount = payloadSize ~/ chunkSize;
 
   late Directory temp;
   late FakeOrigin origin;
   late DiskCache cache;
 
-  DiskCache openCache({
-    String folder = 'cache',
-    int maxBytes = 0,
-    Duration latency = Duration.zero,
-  }) {
-    origin.latency = latency;
-    return DiskCache(
-      root: Directory(p.join(temp.path, folder)),
-      chunkSize: chunkSize,
-      maxBytes: maxBytes,
-      origin: origin,
-      log: Logger('test'),
-      maxConcurrentUpstream: 4,
-    );
-  }
+  DiskCache openCache({String folder = 'cache'}) => DiskCache(
+    root: Directory(p.join(temp.path, folder)),
+    chunkSize: chunkSize,
+    origin: origin,
+    log: Logger('test'),
+    maxConcurrentUpstream: 4,
+  );
 
   setUp(() {
     Logger.level = LogLevel.error;
@@ -52,7 +43,7 @@ void main() {
 
   tearDown(() async {
     await cache.close();
-    Logger.reset();
+    Logger.level = LogLevel.info;
     if (temp.existsSync()) temp.deleteSync(recursive: true);
   });
 
@@ -69,7 +60,6 @@ void main() {
       final bitmap = encodeChunkBitmap(<int>[0, 3, 9, 100, 9999], 130);
 
       expect(decodeChunkBitmap(bitmap, 130), <int>{0, 3, 9, 100});
-      expect(countChunkBitmapBits(bitmap), 4);
       expect(decodeChunkBitmap(bitmap, 5), <int>{0, 3});
       expect(decodeChunkBitmap('', 130), isEmpty);
       expect(decodeChunkBitmap(bitmap, 0), isEmpty);
@@ -84,7 +74,6 @@ void main() {
         etag: '"v1"',
         contentType: 'video/mp4',
         lastModified: DateTime.utc(2026, 1, 1),
-        updatedAt: DateTime.utc(2026, 1, 2),
       );
 
       final parsed = CacheEntryMeta.tryParse(jsonEncode(meta.toJson()))!;
@@ -119,15 +108,13 @@ void main() {
 
       expect(data, origin.bytes.sublist(0, 1001));
       expect(entry.knownTotalSize, payloadSize);
-      expect(entry.chunkCount, 4);
       expect(entry.readyChunkCount, 1);
-      expect(entry.isRangeCached(0, 1000), isTrue);
       expect(origin.requestedRanges, <ByteRange>[
         const ByteRange(0, chunkSize - 1),
       ]);
     });
 
-    test('a seek downloads only the chunks covering it', () async {
+    test('a seek downloads only the chunk that covers it', () async {
       final entry = await cache.entryFor('clips/a.mp4');
 
       const start = 200 * 1024;
@@ -138,7 +125,6 @@ void main() {
         const ByteRange(3 * chunkSize, 4 * chunkSize - 1),
       ]);
       expect(entry.readyChunkCount, 1);
-      expect(entry.isRangeCached(0, 1000), isFalse);
     });
 
     test('reassembles a range that spans a chunk boundary', () async {
@@ -186,16 +172,15 @@ void main() {
     );
 
     test(
-      'clamps a range that runs past the end and completes the object',
+      'clamps a range that runs past the end and fills the object',
       () async {
         final entry = await cache.entryFor('clips/a.mp4');
 
         final data = await collect(entry.readRange(0, payloadSize + 9999));
 
         expect(data, origin.bytes);
-        expect(entry.isComplete, isTrue);
-        expect(entry.readyChunkCount, 4);
-        expect(entry.cachedBytes, payloadSize);
+        expect(entry.readyChunkCount, chunkCount);
+        expect(origin.rangeRequestCount, chunkCount);
       },
     );
 
@@ -207,6 +192,13 @@ void main() {
         collect(entry.readRange(0, 10)),
         throwsA(isA<OriginNotFoundException>()),
       );
+    });
+
+    test('hands back the same entry for a repeated key', () async {
+      final first = await cache.entryFor('clips/a.mp4');
+      final second = await cache.entryFor('clips/a.mp4');
+
+      expect(identical(first, second), isTrue);
     });
 
     test(
@@ -267,71 +259,6 @@ void main() {
       expect(origin.rangeRequestCount, greaterThan(requestsBefore));
 
       await reopened.close();
-    });
-  });
-
-  group('budget enforcement', () {
-    test('evicts the least recently used object first', () async {
-      final limited = openCache(maxBytes: budget, folder: 'lru');
-
-      final first = await limited.entryFor('a.mp4');
-      await collect(first.readRange(0, 100));
-
-      final second = await limited.entryFor('b.mp4');
-      await collect(second.readRange(0, 100));
-
-      // Two preallocated 256 KiB files exceed the 300 KiB budget.
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      first.touch();
-
-      await limited.enforceBudget(force: true);
-
-      expect(limited.trackedBytes, lessThanOrEqualTo(budget));
-      expect(limited.peekEntry('a.mp4'), isNotNull);
-      expect(limited.peekEntry('b.mp4'), isNull);
-
-      await limited.close();
-    });
-
-    test('clear(key) drops just that object', () async {
-      final entry = await cache.entryFor('clips/a.mp4');
-      await collect(entry.readRange(0, 100));
-      expect(entry.dataFile.existsSync(), isTrue);
-
-      await cache.clear(key: 'clips/a.mp4');
-
-      expect(cache.peekEntry('clips/a.mp4'), isNull);
-      expect(entry.dataFile.existsSync(), isFalse);
-      expect((await cache.stats()).totalBytes, 0);
-    });
-
-    test('clear() wipes the whole cache directory', () async {
-      final entry = await cache.entryFor('clips/a.mp4');
-      await collect(entry.readRange(0, 100));
-
-      await cache.clear();
-
-      expect(cache.entryCount, 0);
-      expect(cache.root.existsSync(), isTrue);
-      expect((await cache.stats()).totalBytes, 0);
-    });
-
-    test('stats reports per-object progress', () async {
-      final entry = await cache.entryFor('clips/a.mp4');
-      await collect(entry.readRange(0, 100));
-
-      final stats = await cache.stats();
-      final subject = stats.entries.single;
-
-      expect(stats.chunkSize, chunkSize);
-      expect(stats.upstreamCapacity, 4);
-      expect(subject.key, 'clips/a.mp4');
-      expect(subject.chunkCount, 4);
-      expect(subject.readyChunks, 1);
-      expect(subject.cachedBytes, chunkSize);
-      expect(subject.cachedFraction, closeTo(0.25, 0.0001));
-      expect(subject.complete, isFalse);
-      expect(decodeChunkBitmap(subject.chunkBitmap, 4), <int>{0});
     });
   });
 

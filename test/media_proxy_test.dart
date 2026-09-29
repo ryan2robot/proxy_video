@@ -11,6 +11,7 @@ import 'helpers/test_origin.dart';
 
 const int _chunkSize = 64 * 1024;
 const int _payloadSize = 256 * 1024;
+const int _chunkCount = _payloadSize ~/ _chunkSize;
 const String _key = 'clips/a.mp4';
 
 /// A running proxy stack: origin client, cache, proxy and the HTTP server a
@@ -36,7 +37,6 @@ class Rig {
   Future<void> dispose() async {
     client.close(force: true);
     await server.close(force: true);
-    await proxy.whenIdle();
     await cache.close();
     origin.close();
   }
@@ -46,21 +46,15 @@ Future<Rig> startRig({
   required Directory cacheRoot,
   required OriginClient origin,
   int chunkSize = _chunkSize,
-  bool continueAfterDisconnect = true,
 }) async {
   final logger = Logger('test');
   final cache = DiskCache(
     root: cacheRoot,
     chunkSize: chunkSize,
-    maxBytes: 0,
     origin: origin,
     log: logger,
   );
-  final proxy = MediaProxy(
-    cache: cache,
-    continueAfterDisconnect: continueAfterDisconnect,
-    log: logger,
-  );
+  final proxy = MediaProxy(cache: cache, log: logger);
 
   final server = await HttpServer.bind('127.0.0.1', 0);
   unawaited(() async {
@@ -151,6 +145,9 @@ void main() {
     return slow;
   }
 
+  File dataFileOf(Rig rig) =>
+      File(p.join(rig.cache.root.path, 'clips', 'a.mp4.bin'));
+
   setUp(() async {
     Logger.level = LogLevel.error;
     temp = Directory.systemTemp.createTempSync('proxy_video_proxy_test_');
@@ -176,7 +173,7 @@ void main() {
   tearDown(() async {
     await rig.dispose();
     await originServer.stop();
-    Logger.reset();
+    Logger.level = LogLevel.info;
     if (temp.existsSync()) temp.deleteSync(recursive: true);
   });
 
@@ -305,11 +302,6 @@ void main() {
 
       expect(secondBytes, firstBytes);
       expect(originServer.rangeRequestCount, requestsAfterFirst);
-
-      final entry = rig.cache.peekEntry(_key)!;
-      expect(entry.cacheMisses, 1);
-      expect(entry.cacheHits, 1);
-      expect(entry.cacheHitRate, 0.5);
     });
 
     test('a seek fetches only the chunk that covers it', () async {
@@ -323,12 +315,9 @@ void main() {
 
       expect(await drain(response), payload.sublist(start, start + 10));
 
-      final entry = rig.cache.peekEntry(_key)!;
-      expect(entry.upstreamRequestCount, 1);
-      expect(originServer.rangeRequestCount, 1);
+      final entry = await rig.cache.entryFor(_key);
       expect(entry.readyChunkCount, 1);
-      expect(entry.chunkCount, 4);
-      expect(entry.isRangeCached(0, 1000), isFalse);
+      expect(originServer.rangeRequestCount, 1);
     });
 
     test('reuses cached metadata for later HEAD requests', () async {
@@ -350,7 +339,8 @@ void main() {
       final response = await open(rig, _key, range: 'bytes=$from-$to');
 
       expect(await drain(response), payload.sublist(from, to + 1));
-      expect(rig.cache.peekEntry(_key)!.readyChunkCount, 2);
+      final entry = await rig.cache.entryFor(_key);
+      expect(entry.readyChunkCount, 2);
     });
   });
 
@@ -385,8 +375,8 @@ void main() {
       // The byte just handed to the socket is already durable: chunks are
       // written and flushed before they are forwarded, never the other way
       // round. An abort therefore cannot lose work.
-      final entry = gatedRig.cache.peekEntry(_key)!;
-      expect(entry.isRangeCached(0, _chunkSize - 1), isTrue);
+      final entry = await gatedRig.cache.entryFor(_key);
+      expect(entry.readyChunkCount, 1);
 
       gated.gate.complete();
       await completion;
@@ -405,9 +395,11 @@ void main() {
         final response = await open(slowRig, _key);
         expect(response.statusCode, HttpStatus.ok);
 
-        final entry = slowRig.cache.peekEntry(_key)!;
+        final entry = await slowRig.cache.entryFor(_key);
+        final collected = BytesBuilder(copy: false);
         final firstPiece = Completer<int>();
         final completion = response.forEach((List<int> piece) {
+          collected.add(piece);
           if (!firstPiece.isCompleted) {
             firstPiece.complete(entry.readyChunkCount);
           }
@@ -420,10 +412,10 @@ void main() {
 
         expect(
           readyWhenFirstPieceArrived,
-          lessThan(entry.chunkCount),
+          lessThan(_chunkCount),
           reason: 'bytes must arrive before the whole object is cached',
         );
-        expect(entry.isComplete, isTrue);
+        expect(collected.takeBytes(), payload);
       },
     );
   });
@@ -453,19 +445,23 @@ void main() {
       // The fetch the proxy already started must not be collateral damage: it
       // is deliberately decoupled from the client's stream.
       gated.gate.complete();
-      final entry = gatedRig.cache.peekEntry(_key)!;
+      final entry = await gatedRig.cache.entryFor(_key);
       await waitFor(
         () => entry.readyChunkCount >= 2,
         description: 'the in-flight chunk to land on disk',
       );
 
-      expect(entry.isRangeCached(0, 2 * _chunkSize - 1), isTrue);
+      final cached = BytesBuilder(copy: false);
+      await for (final piece in entry.readRange(0, _chunkSize - 1)) {
+        cached.add(piece);
+      }
+      expect(cached.takeBytes(), payload.sublist(0, _chunkSize));
     });
 
-    test('a connection that dies mid-response does not lose the work', () async {
+    test('a dead connection keeps every byte already fetched', () async {
       final gated = GatedOrigin(payload);
       final gatedRig = await startRig(
-        cacheRoot: Directory(p.join(temp.path, 'resume-cache')),
+        cacheRoot: Directory(p.join(temp.path, 'dead-peer-cache')),
         origin: gated,
       );
       addTearDown(gatedRig.dispose);
@@ -491,36 +487,44 @@ void main() {
       await subscription.cancel();
       gated.gate.complete();
 
-      // Whichever path the proxy takes — noticing the dead peer and resuming in
-      // the background, or simply finishing the window as it streams — the
-      // guarantee is the same: a fetched chunk is written before its bytes are
-      // handed over, so nothing is discarded.
-      final entry = gatedRig.cache.peekEntry(_key)!;
+      final entry = await gatedRig.cache.entryFor(_key);
       await waitFor(
-        () => entry.isComplete,
+        () => entry.readyChunkCount >= 2,
         timeout: const Duration(seconds: 30),
-        description: 'the window to finish landing in the cache',
+        description: 'the in-flight chunk to land on disk',
       );
 
-      expect(entry.cachedBytes, _payloadSize);
-      expect(
-        entry.isRangeCached(0, _payloadSize - 1),
-        isTrue,
-        reason: 'a dead connection must not cost already fetched bytes',
-      );
+      // However far the proxy got — noticing the dead peer at the next chunk or
+      // finishing the window — the guarantee is the same: every chunk it
+      // fetched is intact on disk, so a dead connection never costs work.
+      final readyChunks = entry.readyChunkCount;
+      final cached = BytesBuilder(copy: false);
+      await for (final piece in entry.readRange(
+        0,
+        readyChunks * _chunkSize - 1,
+      )) {
+        cached.add(piece);
+      }
+
+      expect(cached.takeBytes(), payload.sublist(0, readyChunks * _chunkSize));
+      expect(dataFileOf(gatedRig).existsSync(), isTrue);
     });
 
-    test('resumes from the first chunk that is not on disk yet', () async {
-      // The cache is what decides where a background fill picks up, so assert
-      // the rule directly rather than inferring it from a network race.
-      final entry = await rig.cache.entryFor(_key);
-      expect(entry.firstUncachedOffset(0, _payloadSize - 1), 0);
+    test('a follow-up request reuses the chunks left behind', () async {
+      // A player that aborts and immediately asks for the same window again:
+      // whatever landed on disk is reused rather than re-fetched.
+      final first = await drain(
+        await open(rig, _key, range: 'bytes=0-${_chunkSize - 1}'),
+      );
+      expect(first, payload.sublist(0, _chunkSize));
+      final requestsAfterFirst = originServer.rangeRequestCount;
 
-      await drain(await open(rig, _key, range: 'bytes=0-${_chunkSize - 1}'));
+      final second = await drain(
+        await open(rig, _key, range: 'bytes=0-${_chunkSize - 1}'),
+      );
 
-      expect(entry.isRangeCached(0, _chunkSize - 1), isTrue);
-      expect(entry.firstUncachedOffset(0, _payloadSize - 1), _chunkSize);
-      expect(entry.firstUncachedOffset(0, _chunkSize - 1), isNull);
+      expect(second, payload.sublist(0, _chunkSize));
+      expect(originServer.rangeRequestCount, requestsAfterFirst);
     });
   });
 }

@@ -1,11 +1,10 @@
 import 'dart:io';
 
-import 'cache/disk_cache.dart';
-import 'cache/origin_client.dart';
+import 'cache.dart';
 import 'config.dart';
 import 'logger.dart';
-import 'proxy/http_origin_client.dart';
-import 'proxy/media_proxy.dart';
+import 'media_proxy.dart';
+import 'origin.dart';
 
 /// A range proxy over a disk-backed chunk cache, wired up from one [Config].
 ///
@@ -36,19 +35,13 @@ class VideoProxy {
     );
     origin = upstream;
     cache = DiskCache(
-      root: config.cacheDirectory,
+      root: Directory(config.cacheDirPath),
       chunkSize: config.chunkSize,
-      maxBytes: config.maxCacheBytes,
       origin: upstream,
       log: logger,
       maxConcurrentUpstream: config.maxConcurrentUpstream,
-      prefetchAhead: config.prefetchAhead,
     );
-    proxy = MediaProxy(
-      cache: cache,
-      continueAfterDisconnect: config.continueAfterDisconnect,
-      log: logger,
-    );
+    proxy = MediaProxy(cache: cache, log: logger);
   }
 
   /// Settings this instance was built from.
@@ -70,12 +63,11 @@ class VideoProxy {
   Future<void> serve(HttpRequest request, String key) =>
       proxy.serve(request, key);
 
-  /// Waits for background fills, flushes cache metadata and drops connections.
+  /// Flushes cache metadata and drops upstream connections.
   ///
   /// Call this once when the surrounding application shuts down: without it a
   /// restart can leave a half-written chunk or an open upstream socket behind.
   Future<void> close() async {
-    await proxy.whenIdle();
     await cache.close();
     origin.close();
   }

@@ -1,71 +1,23 @@
-import 'dart:async';
 import 'dart:typed_data';
 
 import 'package:proxy_video/proxy_video.dart';
 import 'package:test/test.dart';
 
 void main() {
-  group('parseByteSize', () {
-    test('accepts plain byte counts', () {
-      expect(parseByteSize('4096'), 4096);
-      expect(parseByteSize(' 1048576 '), 1048576);
-    });
-
-    test('accepts binary suffixes case-insensitively', () {
-      expect(parseByteSize('1K'), 1024);
-      expect(parseByteSize('1k'), 1024);
-      expect(parseByteSize('512KB'), 512 * 1024);
-      expect(parseByteSize('2M'), 2 << 20);
-      expect(parseByteSize('1G'), 1 << 30);
-    });
-
-    test('rejects garbage and negative values', () {
-      expect(() => parseByteSize('abc'), throwsA(isA<FormatException>()));
-      expect(() => parseByteSize('-1'), throwsA(isA<FormatException>()));
-      expect(() => parseByteSize('1.5M'), throwsA(isA<FormatException>()));
-      expect(() => parseByteSize(''), throwsA(isA<FormatException>()));
-    });
-
-    test('names the offending option in the error message', () {
-      expect(
-        () => parseByteSize('nope', label: '--max-cache-bytes'),
-        throwsA(
-          isA<FormatException>().having(
-            (FormatException e) => e.message,
-            'message',
-            contains('--max-cache-bytes'),
-          ),
-        ),
-      );
-    });
-  });
-
-  group('formatByteSize', () {
-    test('renders binary units', () {
-      expect(formatByteSize(0), '0 B');
-      expect(formatByteSize(512), '512 B');
-      expect(formatByteSize(1024), '1.00 KiB');
-      expect(formatByteSize(100 * 1024), '100 KiB');
-      expect(formatByteSize(1 << 20), '1.00 MiB');
-      expect(formatByteSize(2 << 30), '2.00 GiB');
-    });
-  });
-
   group('Semaphore', () {
-    test('hands out permits up to capacity', () async {
+    test('hands out permits up to capacity and blocks beyond it', () async {
       final semaphore = Semaphore(2);
-
       await semaphore.acquire();
       await semaphore.acquire();
 
-      expect(semaphore.inUse, 2);
-      expect(semaphore.available, 0);
-      expect(semaphore.tryAcquire(), isFalse);
+      var extraAcquired = false;
+      final extra = semaphore.acquire().then((_) => extraAcquired = true);
+      await Future<void>.delayed(Duration.zero);
+      expect(extraAcquired, isFalse, reason: 'no permit is left');
 
       semaphore.release();
-      expect(semaphore.available, 1);
-      expect(semaphore.tryAcquire(), isTrue);
-      expect(semaphore.waiting, 0);
+      await extra;
+      expect(extraAcquired, isTrue);
     });
 
     test('serves waiters in FIFO order', () async {
@@ -75,8 +27,6 @@ void main() {
       final order = <int>[];
       final first = semaphore.acquire().then((_) => order.add(1));
       final second = semaphore.acquire().then((_) => order.add(2));
-
-      expect(semaphore.waiting, 2);
 
       semaphore.release();
       await first;
@@ -94,22 +44,8 @@ void main() {
         throwsA(isA<StateError>()),
       );
 
-      expect(semaphore.inUse, 0);
-      expect(semaphore.tryAcquire(), isTrue);
-    });
-
-    test('times out instead of queueing forever', () async {
-      final semaphore = Semaphore(1);
-      await semaphore.acquire();
-
-      await expectLater(
-        semaphore.acquire(timeout: const Duration(milliseconds: 20)),
-        throwsA(isA<TimeoutException>()),
-      );
-
-      expect(semaphore.waiting, 0);
-      semaphore.release();
-      expect(semaphore.available, 1);
+      // The permit came back: a fresh acquisition does not wait for one.
+      await semaphore.withPermit<void>(() async {});
     });
 
     test('release without a matching acquire throws', () {
@@ -118,16 +54,48 @@ void main() {
     });
   });
 
+  group('AsyncMutex', () {
+    test('runs queued sections one at a time, in order', () async {
+      final mutex = AsyncMutex();
+      final order = <int>[];
+
+      final first = mutex.run(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+        order.add(1);
+      });
+      final second = mutex.run(() async => order.add(2));
+      await Future.wait<void>(<Future<void>>[first, second]);
+
+      expect(order, <int>[1, 2]);
+    });
+
+    test('a failing section does not stall the queue', () async {
+      final mutex = AsyncMutex();
+
+      final failing = mutex.run<void>(() async => throw StateError('boom'));
+      final following = mutex.run(() async => 42);
+
+      await expectLater(failing, throwsA(isA<StateError>()));
+      expect(await following, 42);
+    });
+  });
+
   group('Logger', () {
-    tearDown(Logger.reset);
+    late List<String> lines;
+
+    setUp(() {
+      lines = <String>[];
+      Logger.sink = lines.add;
+      Logger.level = LogLevel.info;
+    });
+
+    tearDown(() {
+      Logger.sink = null;
+      Logger.level = LogLevel.info;
+    });
 
     test('respects the level threshold and renders structured fields', () {
-      final lines = <String>[];
-      Logger.configure(
-        level: LogLevel.warn,
-        colorEnabled: false,
-        output: lines.add,
-      );
+      Logger.level = LogLevel.warn;
 
       final logger = Logger('proxy');
       logger.info('hidden');
@@ -144,12 +112,7 @@ void main() {
     });
 
     test('redacts binary payloads and collapses newlines', () {
-      final lines = <String>[];
-      Logger.configure(
-        level: LogLevel.debug,
-        colorEnabled: false,
-        output: lines.add,
-      );
+      Logger.level = LogLevel.debug;
 
       Logger('bin').debug(
         'payload',
@@ -165,25 +128,13 @@ void main() {
     });
 
     test('derives namespaced children', () {
-      final lines = <String>[];
-      Logger.configure(
-        level: LogLevel.info,
-        colorEnabled: false,
-        output: lines.add,
-      );
-
       Logger('a').child('b').info('hi');
 
       expect(lines.single, contains('[a.b] hi'));
     });
 
     test('appends the error message and stack trace lines', () {
-      final lines = <String>[];
-      Logger.configure(
-        level: LogLevel.error,
-        colorEnabled: false,
-        output: lines.add,
-      );
+      Logger.level = LogLevel.error;
 
       Logger('proxy').error(
         'upstream failed',

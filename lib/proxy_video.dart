@@ -7,15 +7,10 @@
 /// is assembled from, exposed for callers that need to wire them differently.
 library;
 
-export 'src/cache/cache_entry.dart';
-export 'src/cache/disk_cache.dart';
-export 'src/cache/origin_client.dart';
+export 'src/cache.dart';
 export 'src/config.dart';
 export 'src/logger.dart';
-export 'src/proxy/http_origin_client.dart';
-export 'src/proxy/media_proxy.dart';
-export 'src/util/byte_range.dart';
-export 'src/util/byte_size.dart';
-export 'src/util/http_util.dart';
-export 'src/util/semaphore.dart';
+export 'src/media_proxy.dart';
+export 'src/origin.dart';
+export 'src/util.dart';
 export 'src/video_proxy.dart';

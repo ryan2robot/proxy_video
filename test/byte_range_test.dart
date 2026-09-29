@@ -10,7 +10,6 @@ void main() {
       final result = parse(null, 1000);
 
       expect(result.kind, RangeParseKind.none);
-      expect(result.wantsFullBody, isTrue);
       expect(result.range, isNull);
     });
 
@@ -63,7 +62,6 @@ void main() {
       expect(parse('bytes=1000-', 1000).kind, RangeParseKind.unsatisfiable);
       expect(parse('bytes=1000-2000', 1000).kind, RangeParseKind.unsatisfiable);
       expect(parse('bytes=5000-6000', 1000).kind, RangeParseKind.unsatisfiable);
-      expect(parse('bytes=1000-', 1000).isUnsatisfiable, isTrue);
     });
 
     test('a suffix-length of zero matches no byte', () {
@@ -87,7 +85,7 @@ void main() {
       final result = parse('items=0-10', 1000);
 
       expect(result.kind, RangeParseKind.ignore);
-      expect(result.wantsFullBody, isTrue);
+      expect(result.range, isNull);
       expect(result.note, contains('unsupported range unit'));
     });
 
@@ -95,7 +93,6 @@ void main() {
       final result = parse('bytes=0-99,200-299', 1000);
 
       expect(result.kind, RangeParseKind.ignore);
-      expect(result.wantsFullBody, isTrue);
       expect(result.note, contains('multi-range'));
     });
 
